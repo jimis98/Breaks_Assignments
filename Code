@@ -1,0 +1,352 @@
+# Install required library
+!pip install --quiet gspread pandas oauth2client
+from datetime import datetime, timedelta
+import pandas as pd
+import gspread
+from google.colab import auth
+from google.auth import default
+import random
+import numpy as np
+from collections import defaultdict
+
+# Authenticate and create the service
+auth.authenticate_user()
+creds, _ = default()
+gc = gspread.authorize(creds)
+
+# Open the Google Sheet
+spreadsheet_key = '14c18zy5yC0jCSAMLItjf2Cc_SSYmmln6QWr5ZT7UjPM'
+sheet = gc.open_by_key(spreadsheet_key)
+
+def get_break_overlaps(df):
+    overlaps = defaultdict(list)
+
+    def to_minutes(tstr):
+        h, m = map(int, tstr.split(':'))
+        return h * 60 + m
+
+    # Group by shift
+    for shift, group in df.groupby('Shift'):
+        breaks = []
+        for idx, row in group.iterrows():
+            worker_id = idx
+            worker_breaks = []
+            if pd.notna(row['2nd Break']):
+              worker_breaks.append((to_minutes(row['1st Break']), 10, worker_id, '1st Break'))
+              worker_breaks.append((to_minutes(row['2nd Break']), 20, worker_id, '2nd Break'))
+              worker_breaks.append((to_minutes(row['3rd Break']), 10, worker_id, '3rd Break'))
+            elif pd.notna(row['1st Break']):
+              worker_breaks.append((to_minutes(row['1st Break']), 25, worker_id, 'Break'))
+
+            breaks.extend(worker_breaks)
+
+        # Έλεγχος για overlaps
+        for i in range(len(breaks)):
+            for j in range(i + 1, len(breaks)):
+                s1, d1, id1, label1 = breaks[i]
+                s2, d2, id2, label2 = breaks[j]
+                e1 = s1 + d1
+                e2 = s2 + d2
+                if max(s1, s2) < min(e1, e2):  # Υπάρχει επικάλυψη
+                    overlaps[shift].append({
+                        'Worker 1': id1,
+                        'Break 1': label1,
+                        'Time 1': f"{s1 // 60:02d}:{s1 % 60:02d}",
+                        'Worker 2': id2,
+                        'Break 2': label2,
+                        'Time 2': f"{s2 // 60:02d}:{s2 % 60:02d}"
+                    })
+
+    return overlaps
+
+
+def get_overlap_per_shift(df):
+
+
+    # Αποθήκευση αποτελεσμάτων ανά Shift
+    results = {}
+
+    # Ομαδοποίηση ανά Shift
+    grouped = df.groupby('Shift')
+
+    for shift, group in grouped:
+        timeline = [0] * 1440
+        total_workers_shift = len(group)
+
+        for _, row in group.iterrows():
+            if pd.notna(row['2nd Break']):
+                breaks = [
+                    (row['1st Break'], 10),
+                    (row['2nd Break'], 20),
+                    (row['3rd Break'], 10)
+                ]
+            elif pd.notna(row['1st Break']):
+                breaks = [(row['1st Break'], 25)]
+            else:
+                breaks = []
+
+            for start_str, duration in breaks:
+                if duration == 0 or pd.isna(start_str):
+                    continue
+                h, m = map(int, start_str.split(':'))
+                start_min = h * 60 + m
+                for i in range(start_min, start_min + duration):
+                    if 0 <= i < 1440:
+                        timeline[i] += 1
+
+        if total_workers_shift <= 1:
+            peak_overlap = max(timeline) if total_workers_shift == 1 else 0
+            percent_overlap = 0
+        else:
+            peak_overlap = max(timeline)
+            if peak_overlap <= 1:
+                percent_overlap = 0
+            else:
+                percent_overlap = round((peak_overlap / total_workers_shift) * 100, 2)
+
+
+
+        results[shift] = {
+            'peak_overlap': peak_overlap,
+            'percent_overlap': percent_overlap,
+            'total_workers': total_workers_shift
+        }
+
+    return results
+
+def get_global_overlap_stats(df):
+
+    timeline = [0] * 1440  # Λεπτά ημέρας (0 έως 1439)
+
+   # Βοηθητική για ώρα → λεπτά
+    def time_to_minutes(tstr):
+        try:
+            if isinstance(tstr, str):
+                tstr = tstr.strip()
+            h, m = map(int, str(tstr).split(':'))
+            return h * 60 + m
+        except:
+            return None  # Αγνόησε μη έγκυρη ώρα
+
+    # Βοηθητική για λεπτά → ώρα string
+    def minutes_to_time_str(mins):
+        h = mins // 60
+        m = mins % 60
+        return f"{h:02d}:{m:02d}"
+
+    # Πέρασμα όλων των διαλειμμάτων
+    for _, row in df.iterrows():
+        breaks = []
+        if pd.notna(row['2nd Break']):
+            breaks = [(row['1st Break'], 10), (row['2nd Break'], 20), (row['3rd Break'], 10)]
+        elif pd.notna(row['1st Break']):
+            breaks = [(row['1st Break'], 25)]
+
+        for start_str, duration in breaks:
+            if duration == 0 or pd.isna(start_str):
+                continue
+            start_min = time_to_minutes(start_str)
+            for i in range(start_min, start_min + duration):
+                if 0 <= i < 1440:
+                    timeline[i] += 1
+
+    peak_overlap = max(timeline)
+    peak_minute = timeline.index(peak_overlap)
+    peak_time = minutes_to_time_str(peak_minute)
+    total_workers = len(df)
+    percent_overlap = round((peak_overlap / total_workers) * 100, 2)
+
+    return peak_overlap, percent_overlap, peak_time
+
+def assign_breaks_optimized_all(data, attempts):
+    total_workers = len(data)
+    best_assignment = None
+    lowest_peak = float('inf')
+    best_peak_percent = 100.0
+
+    def intervals_overlap(start1, dur1, start2, dur2):
+        end1 = start1 + timedelta(minutes=dur1)
+        end2 = start2 + timedelta(minutes=dur2)
+        return max(start1, start2) < min(end1, end2)
+
+    def overlap_minutes(start1, dur1, start2, dur2):
+        end1 = start1 + timedelta(minutes=dur1)
+        end2 = start2 + timedelta(minutes=dur2)
+        overlap = (min(end1, end2) - max(start1, start2)).total_seconds() / 60
+        return max(0, overlap)
+
+    for _ in range(attempts):
+        temp_data = data.copy()
+        assigned_breaks_per_shift = {}
+
+        for idx, row in temp_data.iterrows():
+            shift_time_str = row['Shift'].split('-')[0].strip()
+            if shift_time_str == '':
+                continue
+            else:
+                shift_start = datetime.strptime(shift_time_str, "%H:%M")
+            time_type = row['Time Type']
+            breaks = {}
+            shift_key = row['Shift']
+
+            if shift_key not in assigned_breaks_per_shift:
+                assigned_breaks_per_shift[shift_key] = []
+
+            if time_type == '8:00:00':  # Full-time
+                durations = [15, 25, 15]
+                best_candidate = None
+                min_total_overlap = float('inf')
+
+                for attempt_try in range(50):
+                    # Ξεχωριστά random offsets για κάθε διάλειμμα
+                    offset1 = random.uniform(1.5, 2.5)
+                    offset2 = random.uniform(1.5, 2.5)
+                    offset3 = random.uniform(1.5, 2.5)
+
+                    first_break = shift_start + timedelta(hours=offset1)
+                    m1 = (first_break.minute // 5) * 5
+                    first_break = first_break.replace(minute=m1, second=0)
+
+                    second_break = first_break + timedelta(hours=offset2)
+                    m2 = (second_break.minute // 5) * 5
+                    second_break = second_break.replace(minute=m2, second=0)
+
+                    # Επιλογή third break
+                    third_break = None
+                    shift_end = shift_start + timedelta(hours=8)
+                    candidates_third = []
+
+                    for offset_minutes in range(90, 151, 5):
+                        possible_third = second_break + timedelta(minutes=offset_minutes)
+                        m3 = (possible_third.minute // 5) * 5
+                        possible_third = possible_third.replace(minute=m3, second=0)
+                        time_to_end = shift_end - possible_third
+
+                        if timedelta(hours=1.5) <= time_to_end <= timedelta(hours=2.5):
+                            candidates_third.append(possible_third)
+
+                    for candidate_third in candidates_third:
+                        third_break = candidate_third
+
+                        overlaps = 0
+                        for (ab_start, ab_dur) in assigned_breaks_per_shift[shift_key]:
+                            overlaps += overlap_minutes(first_break, 15, ab_start, ab_dur)
+                            overlaps += overlap_minutes(second_break, 25, ab_start, ab_dur)
+                            overlaps += overlap_minutes(third_break, 15, ab_start, ab_dur)
+
+                        # Εσωτερικά overlaps (μεταξύ των 3 διαλειμμάτων του ίδιου agent)
+                        overlaps += overlap_minutes(first_break, 15, second_break, 25)
+                        overlaps += overlap_minutes(second_break, 25, third_break, 15)
+                        overlaps += overlap_minutes(first_break, 15, third_break, 15)
+
+                        if overlaps < min_total_overlap:
+                            min_total_overlap = overlaps
+                            best_candidate = [first_break, second_break, third_break]
+
+                        if overlaps == 0:
+                            break  # early exit για να μην δοκιμάζει παραπάνω
+
+                    if min_total_overlap == 0:
+                        break  # δεν χρειάζεται άλλες προσπάθειες
+
+                # Καταχώρηση του καλύτερου set
+                first_break, second_break, third_break = best_candidate
+                breaks['1st Break'], breaks['2nd Break'], breaks['3rd Break'] = best_candidate
+
+                for cb, dur in zip([first_break, second_break, third_break], durations):
+                    assigned_breaks_per_shift[shift_key].append((cb, dur))
+
+            else:  # Part-time
+                duration = 30
+                best_candidate = None
+                min_total_overlap = float('inf')
+
+                for attempt_try in range(50):
+                    base_offset = random.uniform(1.5, 2.5)
+                    candidate_break = shift_start + timedelta(hours=base_offset)
+                    m = (candidate_break.minute // 5) * 5
+                    candidate_break = candidate_break.replace(minute=m, second=0)
+
+                    overlaps = 0
+                    for (ab_start, ab_dur) in assigned_breaks_per_shift.get(shift_key, []):
+                        overlaps += overlap_minutes(candidate_break, duration, ab_start, ab_dur)
+
+                    if overlaps < min_total_overlap:
+                        min_total_overlap = overlaps
+                        best_candidate = candidate_break
+
+                    if overlaps == 0:
+                        break
+
+                breaks['1st Break'] = best_candidate
+                assigned_breaks_per_shift.setdefault(shift_key, []).append((best_candidate, duration))
+
+            # Ενημέρωση στο DataFrame
+            temp_data.at[idx, '1st Break'] = breaks['1st Break'].strftime("%H:%M")
+            temp_data.at[idx, '2nd Break'] = breaks.get('2nd Break').strftime("%H:%M") if breaks.get('2nd Break') else None
+            temp_data.at[idx, '3rd Break'] = breaks.get('3rd Break').strftime("%H:%M") if breaks.get('3rd Break') else None
+
+        # Υπολογισμός συνολικού overlap
+        timeline = [0] * (24 * 60)
+        for idx, row in temp_data.iterrows():
+            for b_col, dur in zip(['1st Break', '2nd Break', '3rd Break'], [10, 20, 10]):
+                b_str = row.get(b_col)
+                if pd.notna(b_str) and b_str:
+                    start_min = int(b_str.split(':')[0]) * 60 + int(b_str.split(':')[1])
+                    for i in range(start_min, start_min + dur):
+                        if i < len(timeline):
+                            timeline[i] += 1
+
+        peak = max(timeline)
+        peak_percent = round((peak / total_workers) * 100, 2)
+
+        if peak < lowest_peak:
+            lowest_peak = peak
+            best_peak_percent = peak_percent
+            best_assignment = temp_data.copy()
+
+    return best_assignment
+
+
+
+# Δημιουργία ή επιλογή του "Results" φύλλου
+try:
+    results_ws = sheet.worksheet("Results")
+    results_ws.clear()
+except gspread.exceptions.WorksheetNotFound:
+    results_ws = sheet.add_worksheet(title="Results", rows="100", cols="10")
+
+results_logs = []
+
+def log_result(msg):
+    print(msg)
+    results_logs.append([msg])
+
+# Μέσα στη main loop:
+
+for day in range(1, 8):
+    day_data = pd.DataFrame(sheet.worksheet(f"Day{day}").get_all_records())
+    result = assign_breaks_optimized_all(day_data, attempts=500)
+    result = result.reset_index(drop=True)
+    peak, percent, peak_minute = get_global_overlap_stats(result)
+    log_result(f"🔍 Global Overlap Day{day}: Μέγιστο {peak} άτομα ταυτόχρονα στις {peak_minute} ({percent}%)")
+    shift_overlaps = get_overlap_per_shift(result)
+    for shift, stats in shift_overlaps.items():
+        if stats['peak_overlap'] > 1:
+            log_result(f"  - Shift {shift}: Μέγιστο Overlap {stats['peak_overlap']} άτομα ({stats['percent_overlap']}%) από σύνολο {stats['total_workers']}")
+        else:
+            log_result(f"  - Shift {shift}: Δεν υπάρχει overlap στο σύνολο {stats['total_workers']}")
+    detailed_overlaps = get_break_overlaps(result)
+    for shift, conflict_list in detailed_overlaps.items():
+        if conflict_list:
+            log_result(f"\n❗ Overlaps στο Shift {shift}:")
+            for conflict in conflict_list:
+                log_result(f"  - Εργαζόμενος {conflict['Worker 1']} ({conflict['Break 1']} @ {conflict['Time 1']}) επικαλύπτεται με {conflict['Worker 2']} ({conflict['Break 2']} @ {conflict['Time 2']})")
+
+    # Ενημέρωση του αντίστοιχου φύλλου ημέρας
+    worksheet = sheet.worksheet(f"Day{day}")
+    worksheet.update([result.columns.values.tolist()] + result.values.tolist())
+
+# Τέλος, γράψε όλα τα αποτελέσματα στο φύλλο "Results"
+results_ws.clear()
+results_ws.update('A1', results_logs)
